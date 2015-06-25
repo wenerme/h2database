@@ -11,24 +11,64 @@ import java.io.OutputStream;
 import java.util.PriorityQueue;
 
 /**
- * A stream that supports Golomb and Huffman coding.
+ * A binary arithmetic stream.
  */
-public class BitStream {
-
-    private BitStream() {
-        // a utility class
-    }
+public class BinaryArithmeticStream {
 
     /**
-     * A bit input stream.
+     * The maximum probability.
      */
-    public static class In {
+    public static final int MAX_PROBABILITY = (1 << 12) - 1;
+
+    /**
+     * The low marker.
+     */
+    protected int low;
+
+    /**
+     * The high marker.
+     */
+    protected int high = 0xffffffff;
+
+    /**
+     * A binary arithmetic input stream.
+     */
+    public static class In extends BinaryArithmeticStream {
 
         private final InputStream in;
-        private int current = 0x10000;
+        private int data;
 
-        public In(InputStream in) {
+        public In(InputStream in) throws IOException {
             this.in = in;
+            data = ((in.read() & 0xff) << 24) |
+                    ((in.read() & 0xff) << 16) |
+                    ((in.read() & 0xff) << 8) |
+                    (in.read() & 0xff);
+        }
+
+        /**
+         * Read a bit.
+         *
+         * @param probability the probability that the value is true
+         * @return the value
+         */
+        public boolean readBit(int probability) throws IOException {
+            int split = low + probability * ((high - low) >>> 12);
+            boolean value;
+            // compare unsigned
+            if (data + Integer.MIN_VALUE > split + Integer.MIN_VALUE) {
+                low = split + 1;
+                value = false;
+            } else {
+                high = split;
+                value = true;
+            }
+            while (low >>> 24 == high >>> 24) {
+                data = (data << 8) | (in.read() & 0xff);
+                low <<= 8;
+                high = (high << 8) | 0xff;
+            }
+            return value;
         }
 
         /**
@@ -37,9 +77,9 @@ public class BitStream {
          * @param divisor the divisor
          * @return the value
          */
-        public int readGolomb(int divisor) {
+        public int readGolomb(int divisor) throws IOException {
             int q = 0;
-            while (readBit() == 1) {
+            while (readBit(MAX_PROBABILITY / 2)) {
                 q++;
             }
             int bit = 31 - Integer.numberOfLeadingZeros(divisor - 1);
@@ -47,59 +87,56 @@ public class BitStream {
             if (bit >= 0) {
                 int cutOff = (2 << bit) - divisor;
                 for (; bit > 0; bit--) {
-                    r = (r << 1) + readBit();
+                    r = (r << 1) + (readBit(MAX_PROBABILITY / 2) ? 1 : 0);
                 }
                 if (r >= cutOff) {
-                    r = (r << 1) + readBit() - cutOff;
+                    r = (r << 1) + (readBit(MAX_PROBABILITY / 2) ? 1 : 0) - cutOff;
                 }
             }
             return q * divisor + r;
         }
 
-        /**
-         * Read a bit.
-         *
-         * @return the bit (0 or 1)
-         */
-        public int readBit() {
-            if (current >= 0x10000) {
-                try {
-                    current = 0x100 | in.read();
-                    if (current < 0) {
-                        return -1;
-                    }
-                } catch (IOException e) {
-                    throw new IllegalStateException(e);
-                }
-            }
-            int bit = (current >>> 7) & 1;
-            current <<= 1;
-            return bit;
-        }
-
-        /**
-         * Close the stream. This will also close the underlying stream.
-         */
-        public void close() {
-            try {
-                in.close();
-            } catch (IOException e) {
-                throw new IllegalStateException(e);
-            }
-        }
-
     }
 
     /**
-     * A bit output stream.
+     * A binary arithmetic output stream.
      */
-    public static class Out {
+    public static class Out extends BinaryArithmeticStream {
 
         private final OutputStream out;
-        private int current = 1;
 
         public Out(OutputStream out) {
             this.out = out;
+        }
+
+        /**
+         * Write a bit.
+         *
+         * @param value the value
+         * @param probability the probability that the value is true
+         */
+        public void writeBit(boolean value, int probability) throws IOException {
+            int split = low + probability * ((high - low) >>> 12);
+            if (value) {
+                high = split;
+            } else {
+                low = split + 1;
+            }
+            while (low >>> 24 == high >>> 24) {
+                out.write(high >> 24);
+                low <<= 8;
+                high = (high << 8) | 0xff;
+            }
+        }
+
+        /**
+         * Flush the stream.
+         */
+        public void flush() throws IOException {
+            out.write(high >> 24);
+            out.write(high >> 16);
+            out.write(high >> 8);
+            out.write(high);
         }
 
         /**
@@ -108,12 +145,12 @@ public class BitStream {
          * @param divisor the divisor
          * @param value the value
          */
-        public void writeGolomb(int divisor, int value) {
+        public void writeGolomb(int divisor, int value) throws IOException {
             int q = value / divisor;
             for (int i = 0; i < q; i++) {
-                writeBit(1);
+                writeBit(true, MAX_PROBABILITY / 2);
             }
-            writeBit(0);
+            writeBit(false, MAX_PROBABILITY / 2);
             int r = value - q * divisor;
             int bit = 31 - Integer.numberOfLeadingZeros(divisor - 1);
             if (r < ((2 << bit) - divisor)) {
@@ -122,77 +159,14 @@ public class BitStream {
                 r += (2 << bit) - divisor;
             }
             for (; bit >= 0; bit--) {
-                writeBit((r >>> bit) & 1);
+                writeBit(((r >>> bit) & 1) == 1, MAX_PROBABILITY / 2);
             }
-        }
-
-        /**
-         * Get the size of the Golomb code for this value.
-         *
-         * @param divisor the divisor
-         * @param value the value
-         * @return the number of bits
-         */
-        public static int getGolombSize(int divisor, int value) {
-            int q = value / divisor;
-            int r = value - q * divisor;
-            int bit = 31 - Integer.numberOfLeadingZeros(divisor - 1);
-            if (r < ((2 << bit) - divisor)) {
-                bit--;
-            }
-            return bit + q + 2;
-        }
-
-        /**
-         * Write a bit.
-         *
-         * @param bit the bit (0 or 1)
-         */
-        public void writeBit(int bit) {
-            current = (current << 1) + bit;
-            if (current > 0xff) {
-                try {
-                    out.write(current & 0xff);
-                } catch (IOException e) {
-                    throw new IllegalStateException(e);
-                }
-                current = 1;
-            }
-        }
-
-        /**
-         * Flush the stream. This will at write at most 7 '0' bits.
-         * This will also flush the underlying stream.
-         */
-        public void flush() {
-            while (current > 1) {
-                writeBit(0);
-            }
-            try {
-                out.flush();
-            } catch (IOException e) {
-                throw new IllegalStateException(e);
-            }
-        }
-
-        /**
-         * Flush and close the stream.
-         * This will also close the underlying stream.
-         */
-        public void close() {
-            flush();
-            try {
-                out.close();
-            } catch (IOException e) {
-                throw new IllegalStateException(e);
-            }
-
         }
 
     }
 
     /**
-     * A Huffman code.
+     * A Huffman code table / tree.
      */
     public static class Huffman {
 
@@ -223,11 +197,16 @@ public class BitStream {
          * @param out the output stream
          * @param value the value to write
          */
-        public void write(BitStream.Out out, int value) {
+        public void write(Out out, int value) throws IOException {
             int code = codes[value];
             int bitCount = 30 - Integer.numberOfLeadingZeros(code);
+            Node n = tree;
             for (int i = bitCount; i >= 0; i--) {
-                out.writeBit((code >> i) & 1);
+                boolean goRight = ((code >> i) & 1) == 1;
+                int prob = MAX_PROBABILITY *
+                        n.right.frequency / n.frequency;
+                out.writeBit(goRight, prob);
+                n = goRight ? n.right : n.left;
             }
         }
 
@@ -237,10 +216,13 @@ public class BitStream {
          * @param in the input stream
          * @return the value
          */
-        public int read(BitStream.In in) {
+        public int read(In in) throws IOException {
             Node n = tree;
             while (n.left != null) {
-                n = in.readBit() == 1 ? n.right : n.left;
+                int prob = MAX_PROBABILITY *
+                        n.right.frequency / n.frequency;
+                boolean goRight = in.readBit(prob);
+                n = goRight ? n.right : n.left;
             }
             return n.value;
         }
@@ -255,7 +237,7 @@ public class BitStream {
         int value;
         Node left;
         Node right;
-        private final int frequency;
+        final int frequency;
 
         Node(int value, int frequency) {
             this.frequency = frequency;
